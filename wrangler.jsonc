@@ -35,6 +35,9 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"vars": {
+		"HOSTED_DOMAIN": ""
+	},
 	"observability": {
 		"enabled": true
 	},

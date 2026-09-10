@@ -12,6 +12,15 @@ type Receipt = {
   created_at: string;
 };
 type TopItem = [string, { qty: number; omzet: number }];
+type VariantChild = { label: string; qty: number; omzet: number };
+type ParentItem = { name: string; qty: number; omzet: number; variants: VariantChild[] };
+
+// Mapping harga satuan -> nama varian, berdasarkan katalog produk toko
+// (Cup Besar = Rp6.000, Normal = Rp5.000, konsisten di hampir semua item minuman)
+const VARIANT_PRICE_LABELS: Record<number, string> = {
+  6000: "Cup Besar",
+  5000: "Normal",
+};
 
 // === MCP SERVER ========================================
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
@@ -136,7 +145,7 @@ async function fetchAllReceipts(token: string, fromISO: string, toISO: string): 
   return all;
 }
 
-// === SUMMARIZE =========================================
+// === SUMMARIZE (UNTUK KASIR 1 -- GABUNG SEMUA, POLOS) ===
 function summarize(receipts: Receipt[]) {
   let omzet = 0, laba = 0;
   const itemMap: Record<string, { qty: number; omzet: number }> = {};
@@ -160,6 +169,61 @@ function summarize(receipts: Receipt[]) {
   return { omzet, laba, jumlahTransaksi, rataRata, allItems };
 }
 
+// === BUILD ITEM BERTINGKAT (UNTUK KASIR 2 -- parent + breakdown varian)
+// Item dengan lebih dari 1 harga satuan berbeda akan punya anak varian
+// (label dari VARIANT_PRICE_LABELS, fallback ke harga kalau tidak dikenal).
+// Item dengan cuma 1 harga (tidak ada varian) tampil polos tanpa breakdown.
+function buildKasir2Items(receipts: Receipt[]) {
+  let omzet = 0, laba = 0;
+  const itemMap: Record<
+    string,
+    { qty: number; omzet: number; priceMap: Record<number, { qty: number; omzet: number }> }
+  > = {};
+
+  for (const r of receipts) {
+    omzet += r.total_money || 0;
+    for (const li of r.line_items || []) {
+      laba += (li.total_money || 0) - (li.cost_total || 0);
+      const name = li.item_name;
+      if (!itemMap[name]) itemMap[name] = { qty: 0, omzet: 0, priceMap: {} };
+      itemMap[name].qty += li.quantity || 0;
+      itemMap[name].omzet += li.total_money || 0;
+
+      const unitPrice = li.quantity > 0 ? Math.round((li.total_money || 0) / li.quantity) : 0;
+      if (!itemMap[name].priceMap[unitPrice]) {
+        itemMap[name].priceMap[unitPrice] = { qty: 0, omzet: 0 };
+      }
+      itemMap[name].priceMap[unitPrice].qty += li.quantity || 0;
+      itemMap[name].priceMap[unitPrice].omzet += li.total_money || 0;
+    }
+  }
+
+  const allItems: ParentItem[] = Object.entries(itemMap)
+    .map(([name, d]) => {
+      const priceEntries = Object.entries(d.priceMap);
+      const variants: VariantChild[] =
+        priceEntries.length > 1
+          ? priceEntries
+              .map(([priceStr, v]) => {
+                const price = Number(priceStr);
+                return {
+                  label: VARIANT_PRICE_LABELS[price] || `${formatRupiah(price)}/pcs`,
+                  qty: v.qty,
+                  omzet: v.omzet,
+                };
+              })
+              .sort((a, b) => b.qty - a.qty)
+          : [];
+      return { name, qty: d.qty, omzet: d.omzet, variants };
+    })
+    .sort((a, b) => b.qty - a.qty);
+
+  const jumlahTransaksi = receipts.length;
+  const rataRata = jumlahTransaksi > 0 ? omzet / jumlahTransaksi : 0;
+
+  return { omzet, laba, jumlahTransaksi, rataRata, allItems };
+}
+
 // === FORMAT RUPIAH =====================================
 function formatRupiah(n: number) {
   return "Rp" + Math.round(n).toLocaleString("id-ID");
@@ -174,7 +238,21 @@ function formatLaporanToko(nama: string, s: ReturnType<typeof summarize>) {
   if (s.allItems.length > 0) {
     text += `Item terlaris:\n`;
     s.allItems.slice(0, 5).forEach(([name, d], i) => {
-      text += `${i+1}. ${name} - ${d.qty}x (${formatRupiah(d.omzet)})\n`;
+      text += `${i + 1}. ${name} - ${d.qty}x (${formatRupiah(d.omzet)})\n`;
+    });
+  }
+  return text;
+}
+
+function formatLaporanKasir2(s: ReturnType<typeof buildKasir2Items>) {
+  let text = `*Kasir 2*\n`;
+  text += `Omzet: ${formatRupiah(s.omzet)}\n`;
+  text += `Laba: ${formatRupiah(s.laba)}\n`;
+  text += `Transaksi: ${s.jumlahTransaksi}x (rata-rata ${formatRupiah(s.rataRata)})\n`;
+  if (s.allItems.length > 0) {
+    text += `Item terlaris:\n`;
+    s.allItems.slice(0, 5).forEach((it, i) => {
+      text += `${i + 1}. ${it.name} - ${it.qty}x (${formatRupiah(it.omzet)})\n`;
     });
   }
   return text;
@@ -195,7 +273,7 @@ async function generateInsight(
   label: string,
   periodeText: string,
   s1: ReturnType<typeof summarize>,
-  s2: ReturnType<typeof summarize>,
+  s2: ReturnType<typeof buildKasir2Items>,
   totalOmzet: number,
   totalLaba: number,
   totalTransaksi: number
@@ -204,24 +282,35 @@ async function generateInsight(
   const marginKasir2 = s2.omzet > 0 ? ((s2.laba / s2.omzet) * 100).toFixed(1) : "0";
   const marginTotal = totalOmzet > 0 ? ((totalLaba / totalOmzet) * 100).toFixed(1) : "0";
 
+  const topKasir2 = s2.allItems
+    .slice(0, 3)
+    .map((it) => `${it.name} (${it.qty}x, ${formatRupiah(it.omzet)})`)
+    .join(", ");
+
   const dataText = `
 Periode: ${periodeText} (${label})
 Kasir 1: omzet Rp${Math.round(s1.omzet)}, laba Rp${Math.round(s1.laba)}, margin ${marginKasir1}%, ${s1.jumlahTransaksi} transaksi, rata-rata Rp${Math.round(s1.rataRata)}/transaksi
 Kasir 2: omzet Rp${Math.round(s2.omzet)}, laba Rp${Math.round(s2.laba)}, margin ${marginKasir2}%, ${s2.jumlahTransaksi} transaksi, rata-rata Rp${Math.round(s2.rataRata)}/transaksi
 Total gabungan: omzet Rp${Math.round(totalOmzet)}, laba Rp${Math.round(totalLaba)}, margin ${marginTotal}%, ${totalTransaksi} transaksi
-Item terlaris kasir 1: ${s1.allItems.slice(0,3).map(([n,d]) => `${n} (${d.qty}x, Rp${Math.round(d.omzet)})`).join(", ") || "-"}
-Item terlaris kasir 2: ${s2.allItems.slice(0,3).map(([n,d]) => `${n} (${d.qty}x, Rp${Math.round(d.omzet)})`).join(", ") || "-"}
+Item terlaris kasir 1: ${s1.allItems.slice(0, 3).map(([n, d]) => `${n} (${d.qty}x, Rp${Math.round(d.omzet)})`).join(", ") || "-"}
+Item terlaris kasir 2: ${topKasir2 || "-"}
 `.trim();
 
   try {
     const response: any = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
       messages: [
-        { role: "system", content: "Kamu adalah analis bisnis. Berikan insight singkat (maks 3 kalimat) berdasarkan data, fokus pada margin dan saran actionable. Sebutkan angka persen. Jangan basa-basi." },
-        { role: "user", content: dataText }
-      ]
+        {
+          role: "system",
+          content:
+            "Kamu adalah analis bisnis. Berikan insight singkat (maks 3 kalimat) berdasarkan data, fokus pada margin dan saran actionable. Sebutkan angka persen. Jangan basa-basi.",
+        },
+        { role: "user", content: dataText },
+      ],
     });
     return (response.response || "").trim();
-  } catch { return ""; }
+  } catch {
+    return "";
+  }
 }
 
 // === BUILD & SEND REPORT (CRON) =======================
@@ -235,14 +324,14 @@ async function buildAndSendReport(env: Env, label: string, fromDateStr: string, 
   ]);
 
   const s1 = summarize(receipts1);
-  const s2 = summarize(receipts2);
+  const s2 = buildKasir2Items(receipts2);
   const totalOmzet = s1.omzet + s2.omzet;
   const totalLaba = s1.laba + s2.laba;
   const totalTransaksi = s1.jumlahTransaksi + s2.jumlahTransaksi;
 
   let laporan = `📊 *${judul} ${periodeText}*\n\n`;
   laporan += formatLaporanToko("Kasir 1", s1) + "\n";
-  laporan += formatLaporanToko("Kasir 2", s2) + "\n";
+  laporan += formatLaporanKasir2(s2) + "\n";
   laporan += `*TOTAL GABUNGAN*\n`;
   laporan += `Omzet: ${formatRupiah(totalOmzet)}\nLaba: ${formatRupiah(totalLaba)}\nTotal transaksi: ${totalTransaksi}x`;
 
@@ -291,12 +380,12 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
 
   const omzet1: Record<string, number> = {}, omzet2: Record<string, number> = {};
   const laba1: Record<string, number> = {}, laba2: Record<string, number> = {};
-  for (const d of dates) { omzet1[d]=0; omzet2[d]=0; laba1[d]=0; laba2[d]=0; }
+  for (const d of dates) { omzet1[d] = 0; omzet2[d] = 0; laba1[d] = 0; laba2[d] = 0; }
 
-  function bucket(receipts: Receipt[], omzetMap: Record<string,number>, labaMap: Record<string,number>) {
+  function bucket(receipts: Receipt[], omzetMap: Record<string, number>, labaMap: Record<string, number>) {
     for (const r of receipts) {
       const created = new Date(r.created_at);
-      const wibDate = new Date(created.getTime() + 7*60*60*1000).toISOString().split("T")[0];
+      const wibDate = new Date(created.getTime() + 7 * 60 * 60 * 1000).toISOString().split("T")[0];
       if (!(wibDate in omzetMap)) continue;
       omzetMap[wibDate] += r.total_money || 0;
       for (const li of r.line_items || []) {
@@ -308,7 +397,7 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
   bucket(receipts2, omzet2, laba2);
 
   const s1 = summarize(receipts1);
-  const s2 = summarize(receipts2);
+  const s2 = buildKasir2Items(receipts2);
 
   const beyond31Days = isMoreThan31Days(fromDateStr, toDateStr);
   const isDataEmpty = s1.omzet === 0 && s2.omzet === 0;
@@ -317,10 +406,10 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
     periode: `${fromDateStr} s/d ${toDateStr}`,
     days: dates.length,
     dates,
-    omzet1: dates.map(d => Math.round(omzet1[d])),
-    omzet2: dates.map(d => Math.round(omzet2[d])),
-    laba1: dates.map(d => Math.round(laba1[d])),
-    laba2: dates.map(d => Math.round(laba2[d])),
+    omzet1: dates.map((d) => Math.round(omzet1[d])),
+    omzet2: dates.map((d) => Math.round(omzet2[d])),
+    laba1: dates.map((d) => Math.round(laba1[d])),
+    laba2: dates.map((d) => Math.round(laba2[d])),
     totalOmzet1: Math.round(s1.omzet),
     totalOmzet2: Math.round(s2.omzet),
     totalLaba1: Math.round(s1.laba),
@@ -328,7 +417,12 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
     totalTransaksi1: s1.jumlahTransaksi,
     totalTransaksi2: s2.jumlahTransaksi,
     allItems1: s1.allItems.map(([name, data]) => ({ name, qty: data.qty, omzet: Math.round(data.omzet) })),
-    allItems2: s2.allItems.map(([name, data]) => ({ name, qty: data.qty, omzet: Math.round(data.omzet) })),
+    allItems2: s2.allItems.map((it) => ({
+      name: it.name,
+      qty: it.qty,
+      omzet: Math.round(it.omzet),
+      variants: it.variants.map((v) => ({ label: v.label, qty: v.qty, omzet: Math.round(v.omzet) })),
+    })),
     debug: { receipts1: receipts1.length, receipts2: receipts2.length },
     beyond31Days,
     isDataEmpty,
@@ -338,7 +432,8 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
 }
 
 // ================================================================
-// === RENDER HTML DASHBOARD — VERSI MOBILE-FIRST + DARK MODE ===
+// === RENDER HTML DASHBOARD -- KASIR 1 POLOS, KASIR 2 BERTINGKAT +
+// GRADASI EMAS (mirip laporan resmi Loyverse "Penjualan berdasarkan barang")
 // ================================================================
 function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>>): string {
   const fmt = (n: number) => "Rp" + Math.round(n).toLocaleString("id-ID");
@@ -355,23 +450,31 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
       ? "bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30"
       : "bg-white/10 text-white/70 border-white/10 hover:bg-white/20 dark:bg-gray-700/50 dark:text-gray-300 dark:hover:bg-gray-600";
 
+  const kasir2Rows = data.allItems2
+    .map((it) => {
+      const parentRow = `<tr class="bg-gradient-to-r from-amber-500/20 to-amber-400/5 dark:from-amber-500/25 dark:to-amber-400/5 font-semibold border-b border-amber-500/20"><td class="py-2 px-2">${it.name}</td><td class="py-2 px-2">${it.qty}x</td><td class="py-2 px-2">${fmt(it.omzet)}</td></tr>`;
+      const childRows = it.variants
+        .map(
+          (v) =>
+            `<tr class="bg-amber-50/40 dark:bg-amber-900/10 text-gray-600 dark:text-gray-400 border-b border-gray-100 dark:border-slate-700/50"><td class="py-1.5 px-2 pl-6">↳ ${v.label}</td><td class="py-1.5 px-2">${v.qty}x</td><td class="py-1.5 px-2">${fmt(v.omzet)}</td></tr>`
+        )
+        .join("");
+      return parentRow + childRows;
+    })
+    .join("");
+
   return `<!DOCTYPE html>
 <html lang="id" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5" />
   <title>Dashboard Penjualan - Kedai Vitamart</title>
-  <!-- Tailwind CSS via CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- FIX BUG: wajib set darkMode:'class' di sini, kalau tidak Tailwind CDN
-       cuma ngikutin dark mode SISTEM OS, bukan class 'dark' yang di-toggle
-       manual lewat JS -- ini penyebab toggle theme sebelumnya gak jalan -->
   <script>
     tailwind.config = {
       darkMode: 'class'
     }
   </script>
-  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <style>
     * { transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease; }
@@ -489,38 +592,41 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
       </div>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 mb-6">
-      <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 border border-gray-200 dark:border-slate-700">
-        <h2 class="text-base font-semibold mb-3">📦 Semua Item Terjual - Kasir 1</h2>
-        ${data.allItems1.length ? `
-        <div class="table-scroll">
-          <table class="w-full text-sm">
-            <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-slate-700">
-              <tr><th class="text-left py-2">Item</th><th class="text-left py-2">Qty</th><th class="text-left py-2">Omzet</th></tr>
-            </thead>
-            <tbody>
-              ${data.allItems1.map(it => `<tr class="border-b border-gray-100 dark:border-slate-700/50"><td class="py-2">${it.name}</td><td class="py-2">${it.qty}x</td><td class="py-2">${fmt(it.omzet)}</td></tr>`).join("")}
-            </tbody>
-          </table>
-        </div>
-        ` : `<p class="text-gray-400 text-sm py-4 text-center">${showUpgradeMessage ? '🔒 Upgrade untuk lihat data historis' : 'Tidak ada data'}</p>`}
+    <!-- KASIR 1: POLOS, TIDAK DIUBAH -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-gray-200 dark:border-slate-700">
+      <h2 class="text-base font-semibold mb-3">📦 Semua Item Terjual - Kasir 1</h2>
+      ${data.allItems1.length ? `
+      <div class="table-scroll">
+        <table class="w-full text-sm">
+          <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-slate-700">
+            <tr><th class="text-left py-2">Item</th><th class="text-left py-2">Qty</th><th class="text-left py-2">Omzet</th></tr>
+          </thead>
+          <tbody>
+            ${data.allItems1.map((it) => `<tr class="border-b border-gray-100 dark:border-slate-700/50"><td class="py-2">${it.name}</td><td class="py-2">${it.qty}x</td><td class="py-2">${fmt(it.omzet)}</td></tr>`).join("")}
+          </tbody>
+        </table>
       </div>
+      ` : `<p class="text-gray-400 text-sm py-4 text-center">${showUpgradeMessage ? '🔒 Upgrade untuk lihat data historis' : 'Tidak ada data'}</p>`}
+    </div>
 
-      <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 border border-gray-200 dark:border-slate-700">
-        <h2 class="text-base font-semibold mb-3">📦 Semua Item Terjual - Kasir 2</h2>
-        ${data.allItems2.length ? `
-        <div class="table-scroll">
-          <table class="w-full text-sm">
-            <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-slate-700">
-              <tr><th class="text-left py-2">Item</th><th class="text-left py-2">Qty</th><th class="text-left py-2">Omzet</th></tr>
-            </thead>
-            <tbody>
-              ${data.allItems2.map(it => `<tr class="border-b border-gray-100 dark:border-slate-700/50"><td class="py-2">${it.name}</td><td class="py-2">${it.qty}x</td><td class="py-2">${fmt(it.omzet)}</td></tr>`).join("")}
-            </tbody>
-          </table>
-        </div>
-        ` : `<p class="text-gray-400 text-sm py-4 text-center">${showUpgradeMessage ? '🔒 Upgrade untuk lihat data historis' : 'Tidak ada data'}</p>`}
+    <!-- KASIR 2: BERTINGKAT + GRADASI EMAS -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-amber-500/30">
+      <h2 class="text-base font-semibold mb-3 flex items-center gap-2">
+        📦 Semua Item Terjual - Kasir 2
+        <span class="text-xs font-normal text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded-full">dengan varian</span>
+      </h2>
+      ${data.allItems2.length ? `
+      <div class="table-scroll">
+        <table class="w-full text-sm rounded-lg overflow-hidden">
+          <thead class="bg-gradient-to-r from-amber-500 to-amber-400 text-black">
+            <tr><th class="text-left py-2 px-2">Item</th><th class="text-left py-2 px-2">Qty</th><th class="text-left py-2 px-2">Omzet</th></tr>
+          </thead>
+          <tbody>
+            ${kasir2Rows}
+          </tbody>
+        </table>
       </div>
+      ` : `<p class="text-gray-400 text-sm py-4 text-center">${showUpgradeMessage ? '🔒 Upgrade untuk lihat data historis' : 'Tidak ada data'}</p>`}
     </div>
 
     <div class="text-center text-xs text-gray-400 dark:text-gray-500 border-t border-gray-200 dark:border-slate-700 pt-4 mt-4">

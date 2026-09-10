@@ -448,7 +448,7 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
   const activeClass = (condition: boolean) =>
     condition
       ? "bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30"
-      : "bg-white/10 text-white/70 border-white/10 hover:bg-white/20 dark:bg-gray-700/50 dark:text-gray-300 dark:hover:bg-gray-600";
+      : "bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600";
 
   const kasir2Rows = data.allItems2
     .map((it) => {
@@ -579,15 +579,29 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
     </div>
 
     <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-gray-200 dark:border-slate-700">
-      <h2 class="text-base font-semibold mb-3">📈 Tren Omzet Harian</h2>
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <h2 class="text-base font-semibold">📈 Tren Omzet Harian</h2>
+        <div class="flex gap-1.5">
+          <button type="button" onclick="setChartType('trend','bar')" data-chart="trend" data-type="bar" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600">📊 Batang</button>
+          <button type="button" onclick="setChartType('trend','line')" data-chart="trend" data-type="line" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30">📈 Garis</button>
+          <button type="button" onclick="setChartType('trend','pie')" data-chart="trend" data-type="pie" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600">🥧 Pie</button>
+        </div>
+      </div>
       <div class="chart-container">
         <canvas id="trendChart"></canvas>
       </div>
     </div>
 
     <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-gray-200 dark:border-slate-700">
-      <h2 class="text-base font-semibold mb-3">📊 Perbandingan Kasir</h2>
-      <div class="chart-container" style="height:180px;">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <h2 class="text-base font-semibold">📊 Perbandingan Kasir</h2>
+        <div class="flex gap-1.5">
+          <button type="button" onclick="setChartType('compare','bar')" data-chart="compare" data-type="bar" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30">📊 Batang</button>
+          <button type="button" onclick="setChartType('compare','line')" data-chart="compare" data-type="line" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600">📈 Garis</button>
+          <button type="button" onclick="setChartType('compare','pie')" data-chart="compare" data-type="pie" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600">🥧 Pie</button>
+        </div>
+      </div>
+      <div class="chart-container" style="height:220px;">
         <canvas id="compareChart"></canvas>
       </div>
     </div>
@@ -679,52 +693,165 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
     const dates = ${JSON.stringify(data.dates)};
     const omzet1 = ${JSON.stringify(data.omzet1)};
     const omzet2 = ${JSON.stringify(data.omzet2)};
+    const totalOmzet1 = ${data.totalOmzet1};
+    const totalOmzet2 = ${data.totalOmzet2};
+    const totalLaba1 = ${data.totalLaba1};
+    const totalLaba2 = ${data.totalLaba2};
 
-    new Chart(document.getElementById('trendChart'), {
-      type: 'line',
-      data: {
-        labels: dates,
-        datasets: [
-          { label: 'Kasir 1', data: omzet1, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3 },
-          { label: 'Kasir 2', data: omzet2, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', fill: true, tension: 0.3 }
-        ]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: { duration: 800, easing: 'easeInOutQuart' },
-        plugins: {
-          legend: { labels: { color: document.documentElement.classList.contains('dark') ? '#cbd5e1' : '#1e293b' } }
-        },
-        scales: {
-          x: { ticks: { color: document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b', maxRotation: 30, autoSkip: true, maxTicksLimit: 20 } },
-          y: { ticks: { color: document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b', callback: v => 'Rp' + Number(v).toLocaleString('id-ID') } }
-        }
-      }
-    });
+    function themeColor() {
+      return document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b';
+    }
+    function legendColor() {
+      return document.documentElement.classList.contains('dark') ? '#cbd5e1' : '#1e293b';
+    }
 
-    new Chart(document.getElementById('compareChart'), {
-      type: 'bar',
-      data: {
-        labels: ['Omzet', 'Laba'],
-        datasets: [
-          { label: 'Kasir 1', data: [${data.totalOmzet1}, ${data.totalLaba1}], backgroundColor: '#3b82f6' },
-          { label: 'Kasir 2', data: [${data.totalOmzet2}, ${data.totalLaba2}], backgroundColor: '#10b981' }
-        ]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: { duration: 800, easing: 'easeInOutQuart' },
-        plugins: {
-          legend: { labels: { color: document.documentElement.classList.contains('dark') ? '#cbd5e1' : '#1e293b' } }
-        },
-        scales: {
-          x: { ticks: { color: document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b' } },
-          y: { ticks: { color: document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b', callback: v => 'Rp' + Number(v).toLocaleString('id-ID') } }
-        }
+    const pieColors = ['#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
+
+    function pieLegendWithPercent(chart) {
+      const ds = chart.data.datasets[0];
+      const total = ds.data.reduce((a, b) => a + b, 0);
+      return chart.data.labels.map((label, i) => {
+        const value = ds.data[i];
+        const pct = total > 0 ? ((value / total) * 100).toFixed(1) : '0';
+        return {
+          text: label + ' - ' + pct + '%',
+          fillStyle: ds.backgroundColor[i],
+          fontColor: legendColor(),
+          strokeStyle: ds.backgroundColor[i],
+          index: i
+        };
+      });
+    }
+
+    let trendChartInstance = null;
+    let compareChartInstance = null;
+
+    function renderTrendChart(type) {
+      if (trendChartInstance) trendChartInstance.destroy();
+      const ctx = document.getElementById('trendChart');
+
+      if (type === 'pie') {
+        trendChartInstance = new Chart(ctx, {
+          type: 'pie',
+          data: {
+            labels: ['Kasir 1', 'Kasir 2'],
+            datasets: [{ data: [totalOmzet1, totalOmzet2], backgroundColor: [pieColors[0], pieColors[1]] }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                labels: { color: legendColor(), generateLabels: (chart) => pieLegendWithPercent(chart) }
+              },
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                    const pct = total > 0 ? ((ctx.parsed / total) * 100).toFixed(1) : '0';
+                    return ctx.label + ': Rp' + ctx.parsed.toLocaleString('id-ID') + ' (' + pct + '%)';
+                  }
+                }
+              }
+            }
+          }
+        });
+      } else {
+        trendChartInstance = new Chart(ctx, {
+          type: type,
+          data: {
+            labels: dates,
+            datasets: [
+              { label: 'Kasir 1', data: omzet1, borderColor: '#3b82f6', backgroundColor: type === 'bar' ? '#3b82f6' : 'rgba(59,130,246,0.1)', fill: type === 'line', tension: 0.3 },
+              { label: 'Kasir 2', data: omzet2, borderColor: '#10b981', backgroundColor: type === 'bar' ? '#10b981' : 'rgba(16,185,129,0.1)', fill: type === 'line', tension: 0.3 }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 800, easing: 'easeInOutQuart' },
+            plugins: { legend: { labels: { color: legendColor() } } },
+            scales: {
+              x: { ticks: { color: themeColor(), maxRotation: 30, autoSkip: true, maxTicksLimit: 20 } },
+              y: { ticks: { color: themeColor(), callback: v => 'Rp' + Number(v).toLocaleString('id-ID') } }
+            }
+          }
+        });
       }
-    });
+    }
+
+    function renderCompareChart(type) {
+      if (compareChartInstance) compareChartInstance.destroy();
+      const ctx = document.getElementById('compareChart');
+
+      if (type === 'pie') {
+        compareChartInstance = new Chart(ctx, {
+          type: 'pie',
+          data: {
+            labels: ['Kasir 1 - Omzet', 'Kasir 1 - Laba', 'Kasir 2 - Omzet', 'Kasir 2 - Laba'],
+            datasets: [{
+              data: [totalOmzet1, totalLaba1, totalOmzet2, totalLaba2],
+              backgroundColor: pieColors
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                labels: { color: legendColor(), generateLabels: (chart) => pieLegendWithPercent(chart) }
+              },
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                    const pct = total > 0 ? ((ctx.parsed / total) * 100).toFixed(1) : '0';
+                    return ctx.label + ': Rp' + ctx.parsed.toLocaleString('id-ID') + ' (' + pct + '%)';
+                  }
+                }
+              }
+            }
+          }
+        });
+      } else {
+        compareChartInstance = new Chart(ctx, {
+          type: type,
+          data: {
+            labels: ['Omzet', 'Laba'],
+            datasets: [
+              { label: 'Kasir 1', data: [totalOmzet1, totalLaba1], backgroundColor: '#3b82f6', borderColor: '#3b82f6' },
+              { label: 'Kasir 2', data: [totalOmzet2, totalLaba2], backgroundColor: '#10b981', borderColor: '#10b981' }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 800, easing: 'easeInOutQuart' },
+            plugins: { legend: { labels: { color: legendColor() } } },
+            scales: {
+              x: { ticks: { color: themeColor() } },
+              y: { ticks: { color: themeColor(), callback: v => 'Rp' + Number(v).toLocaleString('id-ID') } }
+            }
+          }
+        });
+      }
+    }
+
+    function setChartType(chartName, type) {
+      const buttons = document.querySelectorAll('.chart-type-btn[data-chart="' + chartName + '"]');
+      buttons.forEach(btn => {
+        const isActive = btn.getAttribute('data-type') === type;
+        btn.className = 'chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition ' +
+          (isActive
+            ? 'bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30'
+            : 'bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600');
+      });
+      if (chartName === 'trend') renderTrendChart(type);
+      else renderCompareChart(type);
+    }
+
+    renderTrendChart('line');
+    renderCompareChart('bar');
   </script>
 </body>
 </html>`;

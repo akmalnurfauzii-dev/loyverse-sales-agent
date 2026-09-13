@@ -6,17 +6,36 @@ import { GoogleHandler } from "./google-handler";
 
 // === TIPE ==============================================
 type Props = { name: string; email: string; accessToken: string };
+// [FIX] Tambah receipt_type + variant_name dari API Loyverse
 type Receipt = {
+  receipt_number?: string;
   total_money: number;
-  line_items: { item_name: string; quantity: number; total_money: number; cost_total: number }[];
+  receipt_type?: string;
+  refund_for?: string | null;
   created_at: string;
+  line_items: {
+    item_name: string;
+    variant_name?: string;
+    quantity: number;
+    total_money: number;
+    cost_total: number;
+  }[];
 };
 type TopItem = [string, { qty: number; omzet: number }];
 type VariantChild = { label: string; qty: number; omzet: number };
 type ParentItem = { name: string; qty: number; omzet: number; variants: VariantChild[] };
+// [BARU] Satu baris riwayat refund untuk ditampilkan di dashboard
+type RefundLogEntry = {
+  receiptNumber: string;
+  refundFor: string | null;
+  itemName: string;
+  variantName: string;
+  quantity: number;
+  money: number;
+  time: string; // jam WIB, format HH:mm
+};
 
-// Mapping harga satuan -> nama varian, berdasarkan katalog produk toko
-// (Cup Besar = Rp6.000, Normal = Rp5.000, konsisten di hampir semua item minuman)
+// Fallback label kalau variant_name kosong di API (jarang terjadi, tapi jaga-jaga)
 const VARIANT_PRICE_LABELS: Record<number, string> = {
   6000: "Cup Besar",
   5000: "Normal",
@@ -72,15 +91,22 @@ function dateStrToISORangeWIB(fromDateStr: string, toDateStr: string) {
   return { fromISO, toISO };
 }
 
+// [FIX BUG LAMA] Sebelumnya fungsi-fungsi di bawah ini pakai d.getDate()/
+// d.setDate() (method LOKAL, tergantung timezone runtime) padahal dipanggil
+// dengan offset +07:00 -- kalau runtime-nya bukan +07:00 (Cloudflare Workers
+// selalu UTC), hasilnya bisa geser 1 hari/bulan. Fix: parse sebagai UTC murni
+// (tanpa offset, karena ini aritmatika tanggal kalender, bukan konversi jam
+// nyata) dan pakai method getUTC*/setUTC* supaya hasilnya sama persis di
+// runtime manapun.
 function addDaysToDateStr(dateStr: string, days: number): string {
-  const d = new Date(`${dateStr}T00:00:00+07:00`);
-  d.setDate(d.getDate() + days);
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().split("T")[0];
 }
 
 function addMonthsToDateStr(dateStr: string, months: number): string {
-  const d = new Date(`${dateStr}T00:00:00+07:00`);
-  d.setMonth(d.getMonth() + months);
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCMonth(d.getUTCMonth() + months);
   return d.toISOString().split("T")[0];
 }
 
@@ -98,15 +124,15 @@ function getTodayDateStr(): string {
 }
 
 function getFirstDayOfMonth(dateStr: string): string {
-  const d = new Date(`${dateStr}T00:00:00+07:00`);
-  d.setDate(1);
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(1);
   return d.toISOString().split("T")[0];
 }
 
 function getLastDayOfMonth(dateStr: string): string {
-  const d = new Date(`${dateStr}T00:00:00+07:00`);
-  d.setMonth(d.getMonth() + 1);
-  d.setDate(0);
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCMonth(d.getUTCMonth() + 1);
+  d.setUTCDate(0);
   return d.toISOString().split("T")[0];
 }
 
@@ -116,6 +142,29 @@ function isMoreThan31Days(fromDateStr: string, toDateStr: string): boolean {
   const diffTime = Math.abs(to.getTime() - from.getTime());
   const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
   return diffDays > 31;
+}
+
+// [BARU] Hitung tanggal periode SEBELUMNYA dengan panjang yang sama persis,
+// supaya perbandingan apple-to-apple. Contoh: kalau periode dipilih 7 hari
+// (5-11 Sept), periode sebelumnya juga 7 hari (28 Agu-3 Sept) -- bukan cuma
+// mundur 1 hari, supaya panjang periode konsisten.
+function getPreviousPeriod(fromDateStr: string, toDateStr: string): { prevFrom: string; prevTo: string } {
+  const from = new Date(`${fromDateStr}T00:00:00+07:00`);
+  const to = new Date(`${toDateStr}T00:00:00+07:00`);
+  const diffDays = Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24)) + 1; // jumlah hari inklusif
+  const prevTo = addDaysToDateStr(fromDateStr, -1);
+  const prevFrom = addDaysToDateStr(prevTo, -(diffDays - 1));
+  return { prevFrom, prevTo };
+}
+
+// [BARU] Hitung persentase perubahan dengan aman -- hindari divide-by-zero.
+// Kalau nilai sebelumnya 0 dan sekarang > 0, dianggap "baru" (null artinya
+// tidak ada dasar perbandingan, bukan 0% atau infinity%).
+function calcPercentChange(current: number, previous: number): number | null {
+  if (previous === 0) {
+    return current === 0 ? 0 : null; // null = "Baru", tidak ada basis pembanding
+  }
+  return ((current - previous) / previous) * 100;
 }
 
 // === FETCH DENGAN PAGINATION ===========================
@@ -170,48 +219,61 @@ function summarize(receipts: Receipt[]) {
 }
 
 // === BUILD ITEM BERTINGKAT (UNTUK KASIR 2 -- parent + breakdown varian)
-// Item dengan lebih dari 1 harga satuan berbeda akan punya anak varian
-// (label dari VARIANT_PRICE_LABELS, fallback ke harga kalau tidak dikenal).
-// Item dengan cuma 1 harga (tidak ada varian) tampil polos tanpa breakdown.
+// [FIX UTAMA] Grouping varian sekarang pakai `variant_name` sebagai KEY,
+// bukan `unitPrice`. Sebelumnya, dua baris "Cupbesar" dengan total_money
+// yang beda (karena promo/pembulatan/refund parsial) dianggap dua varian
+// BERBEDA karena unitPrice-nya beda -> pecah jadi 2 baris terpisah, dan
+// kalau salah satu ke-filter (misal net qty jadi 0), yang lain kelihatan
+// seolah cuma "1x" padahal totalnya harusnya 2x.
+// Sekarang: kalau variant_name ada, itu yang dipakai sebagai key -> semua
+// "Cupbesar" digabung jadi satu baris apa pun harganya.
+// Refund (receipt_type === "REFUND") dikurangi (sign = -1), termasuk di
+// level varian, supaya breakdown varian konsisten dengan total omzet.
 function buildKasir2Items(receipts: Receipt[]) {
   let omzet = 0, laba = 0;
   const itemMap: Record<
     string,
-    { qty: number; omzet: number; priceMap: Record<number, { qty: number; omzet: number }> }
+    { qty: number; omzet: number; variantMap: Record<string, { qty: number; omzet: number }> }
   > = {};
 
   for (const r of receipts) {
-    omzet += r.total_money || 0;
-    for (const li of r.line_items || []) {
-      laba += (li.total_money || 0) - (li.cost_total || 0);
-      const name = li.item_name;
-      if (!itemMap[name]) itemMap[name] = { qty: 0, omzet: 0, priceMap: {} };
-      itemMap[name].qty += li.quantity || 0;
-      itemMap[name].omzet += li.total_money || 0;
+    const isRefund = (r.receipt_type || "").toUpperCase() === "REFUND";
+    const sign = isRefund ? -1 : 1;
 
+    omzet += sign * (r.total_money || 0);
+    for (const li of r.line_items || []) {
+      laba += sign * ((li.total_money || 0) - (li.cost_total || 0));
+      const name = li.item_name;
+      if (!itemMap[name]) itemMap[name] = { qty: 0, omzet: 0, variantMap: {} };
+      itemMap[name].qty += sign * (li.quantity || 0);
+      itemMap[name].omzet += sign * (li.total_money || 0);
+
+      // Key varian: pakai variant_name kalau tersedia (paling akurat, ikut
+      // data resmi Loyverse). Kalau kosong, fallback ke harga per unit
+      // sebagai proxy -- bukan sebaliknya.
       const unitPrice = li.quantity > 0 ? Math.round((li.total_money || 0) / li.quantity) : 0;
-      if (!itemMap[name].priceMap[unitPrice]) {
-        itemMap[name].priceMap[unitPrice] = { qty: 0, omzet: 0 };
+      const variantKey =
+        li.variant_name && li.variant_name.trim() !== ""
+          ? li.variant_name.trim()
+          : (VARIANT_PRICE_LABELS[unitPrice] || `${formatRupiah(unitPrice)}/pcs`);
+
+      if (!itemMap[name].variantMap[variantKey]) {
+        itemMap[name].variantMap[variantKey] = { qty: 0, omzet: 0 };
       }
-      itemMap[name].priceMap[unitPrice].qty += li.quantity || 0;
-      itemMap[name].priceMap[unitPrice].omzet += li.total_money || 0;
+      itemMap[name].variantMap[variantKey].qty += sign * (li.quantity || 0);
+      itemMap[name].variantMap[variantKey].omzet += sign * (li.total_money || 0);
     }
   }
 
   const allItems: ParentItem[] = Object.entries(itemMap)
     .map(([name, d]) => {
-      const priceEntries = Object.entries(d.priceMap);
+      // qty !== 0 (bukan > 0) supaya varian net-zero (sale ke-refund penuh)
+      // tetap kebaca sebagai 0x, bukan hilang diam-diam dari data.
+      const variantEntries = Object.entries(d.variantMap).filter(([_, v]) => v.qty !== 0);
       const variants: VariantChild[] =
-        priceEntries.length > 1
-          ? priceEntries
-              .map(([priceStr, v]) => {
-                const price = Number(priceStr);
-                return {
-                  label: VARIANT_PRICE_LABELS[price] || `${formatRupiah(price)}/pcs`,
-                  qty: v.qty,
-                  omzet: v.omzet,
-                };
-              })
+        variantEntries.length > 1
+          ? variantEntries
+              .map(([label, v]) => ({ label, qty: v.qty, omzet: v.omzet }))
               .sort((a, b) => b.qty - a.qty)
           : [];
       return { name, qty: d.qty, omzet: d.omzet, variants };
@@ -222,6 +284,97 @@ function buildKasir2Items(receipts: Receipt[]) {
   const rataRata = jumlahTransaksi > 0 ? omzet / jumlahTransaksi : 0;
 
   return { omzet, laba, jumlahTransaksi, rataRata, allItems };
+}
+
+// === TOTAL GABUNGAN VARIAN NORMAL vs CUP BESAR (BARU) ===
+// Item yang dikecualikan dari agregasi ini -- dihitung sendiri-sendiri
+// sebagai produk mandiri, TIDAK ikut digabung ke total Normal/Cup Besar,
+// karena sifatnya beda (bukan varian ukuran cup yang sama dengan menu lain).
+// Cocokkan case-insensitive & trim supaya tidak sensitif kapitalisasi.
+const EXCLUDED_FROM_VARIANT_TOTAL = [
+  "es teh",
+  "es batu",
+  "pink lava",
+  "green lava",
+  "es kelapa muda",
+  "kelapa 1 butir",
+];
+
+// [FIX] Baca LANGSUNG dari raw receipts (bukan dari allItems/ParentItem yang
+// sudah diproses buildKasir2Items), karena breakdown varian di sana CUMA
+// muncul kalau item punya >1 varian berbeda -- item yang cuma pernah dijual
+// dalam SATU varian (misal "Thai tea" selalu "Normal") tampil flat tanpa
+// breakdown, dan qty-nya jadi kelewat kalau cuma baca dari situ.
+// Juga: label gabungan seperti "Normal / Normal" atau "Cupbesar / Cupbesar"
+// (item dengan 2 modifier ukuran) dicocokkan berdasarkan KEBERADAAN kata
+// "normal"/"cupbesar" di labelnya (substring match), bukan exact match --
+// supaya tetap terhitung sesuai jenisnya, bukan diabaikan total.
+function buildVariantTotals(receipts: Receipt[]): {
+  normal: { qty: number; omzet: number };
+  cupbesar: { qty: number; omzet: number };
+  excludedNames: string[];
+} {
+  let normalQty = 0, normalOmzet = 0, cupQty = 0, cupOmzet = 0;
+
+  for (const r of receipts) {
+    const isRefund = (r.receipt_type || "").toUpperCase() === "REFUND";
+    const sign = isRefund ? -1 : 1;
+
+    for (const li of r.line_items || []) {
+      const nameLower = (li.item_name || "").trim().toLowerCase();
+      if (EXCLUDED_FROM_VARIANT_TOTAL.includes(nameLower)) continue;
+
+      const unitPrice = li.quantity > 0 ? Math.round((li.total_money || 0) / li.quantity) : 0;
+      const variantLabel =
+        li.variant_name && li.variant_name.trim() !== ""
+          ? li.variant_name.trim()
+          : (VARIANT_PRICE_LABELS[unitPrice] || `${formatRupiah(unitPrice)}/pcs`);
+      const labelLower = variantLabel.toLowerCase();
+
+      if (labelLower.includes("cupbesar") || labelLower.includes("cup besar")) {
+        cupQty += sign * (li.quantity || 0);
+        cupOmzet += sign * (li.total_money || 0);
+      } else if (labelLower.includes("normal")) {
+        normalQty += sign * (li.quantity || 0);
+        normalOmzet += sign * (li.total_money || 0);
+      }
+    }
+  }
+
+  return {
+    normal: { qty: normalQty, omzet: normalOmzet },
+    cupbesar: { qty: cupQty, omzet: cupOmzet },
+    excludedNames: EXCLUDED_FROM_VARIANT_TOTAL,
+  };
+}
+// supaya bisa ditampilkan di dashboard untuk audit -- tanpa perlu buka
+// raw API manual tiap kali curiga ada refund janggal.
+function extractRefundLog(receipts: Receipt[]): RefundLogEntry[] {
+  const log: RefundLogEntry[] = [];
+
+  for (const r of receipts) {
+    if ((r.receipt_type || "").toUpperCase() !== "REFUND") continue;
+
+    const created = new Date(r.created_at);
+    const wib = new Date(created.getTime() + 7 * 60 * 60 * 1000);
+    const hh = String(wib.getUTCHours()).padStart(2, "0");
+    const mm = String(wib.getUTCMinutes()).padStart(2, "0");
+
+    for (const li of r.line_items || []) {
+      log.push({
+        receiptNumber: r.receipt_number || "-",
+        refundFor: r.refund_for || null,
+        itemName: li.item_name,
+        variantName: li.variant_name && li.variant_name.trim() !== "" ? li.variant_name.trim() : "-",
+        quantity: li.quantity || 0,
+        money: li.total_money || 0,
+        time: `${hh}:${mm}`,
+      });
+    }
+  }
+
+  // Urutkan dari yang paling baru
+  return log.sort((a, b) => (a.time < b.time ? 1 : -1));
 }
 
 // === FORMAT RUPIAH =====================================
@@ -365,9 +518,16 @@ async function sendDailyReport(env: Env) {
 // === DASHBOARD DATA ====================================
 async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: string) {
   const { fromISO, toISO } = dateStrToISORangeWIB(fromDateStr, toDateStr);
-  const [receipts1, receipts2] = await Promise.all([
+  const { prevFrom, prevTo } = getPreviousPeriod(fromDateStr, toDateStr);
+  const { fromISO: prevFromISO, toISO: prevToISO } = dateStrToISORangeWIB(prevFrom, prevTo);
+
+  // Fetch periode sekarang DAN periode sebelumnya sekaligus (paralel),
+  // supaya nggak nambah waktu loading dua kali lipat.
+  const [receipts1, receipts2, prevReceipts1, prevReceipts2] = await Promise.all([
     fetchAllReceipts(env.LOYVERSE_API_TOKEN, fromISO, toISO),
     fetchAllReceipts(env.LOYVERSE_API_TOKEN_2, fromISO, toISO),
+    fetchAllReceipts(env.LOYVERSE_API_TOKEN, prevFromISO, prevToISO),
+    fetchAllReceipts(env.LOYVERSE_API_TOKEN_2, prevFromISO, prevToISO),
   ]);
 
   const dates: string[] = [];
@@ -382,22 +542,71 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
   const laba1: Record<string, number> = {}, laba2: Record<string, number> = {};
   for (const d of dates) { omzet1[d] = 0; omzet2[d] = 0; laba1[d] = 0; laba2[d] = 0; }
 
-  function bucket(receipts: Receipt[], omzetMap: Record<string, number>, labaMap: Record<string, number>) {
+  // Kasir 2 handle refund; Kasir 1 tetap seperti semula (tidak ada laporan
+  // refund yang diketahui di kasir 1 -- kalau ke depan ada, tinggal ganti
+  // parameter terakhir jadi true juga).
+  function bucket(
+    receipts: Receipt[],
+    omzetMap: Record<string, number>,
+    labaMap: Record<string, number>,
+    handleRefund: boolean = false
+  ) {
     for (const r of receipts) {
       const created = new Date(r.created_at);
       const wibDate = new Date(created.getTime() + 7 * 60 * 60 * 1000).toISOString().split("T")[0];
       if (!(wibDate in omzetMap)) continue;
-      omzetMap[wibDate] += r.total_money || 0;
+      const isRefund = handleRefund && (r.receipt_type || "").toUpperCase() === "REFUND";
+      const sign = isRefund ? -1 : 1;
+      omzetMap[wibDate] += sign * Math.abs(r.total_money || 0);
       for (const li of r.line_items || []) {
-        labaMap[wibDate] += (li.total_money || 0) - (li.cost_total || 0);
+        labaMap[wibDate] += sign * ((li.total_money || 0) - (li.cost_total || 0));
       }
     }
   }
-  bucket(receipts1, omzet1, laba1);
-  bucket(receipts2, omzet2, laba2);
+  bucket(receipts1, omzet1, laba1, false); // Kasir 1: default (tidak handle refund)
+  bucket(receipts2, omzet2, laba2, true);  // Kasir 2: handle refund
+
+  // [BARU] Agregasi per JAM (00:00-23:00), digabung lintas-tanggal kalau
+  // rangenya lebih dari 1 hari -- supaya kelihatan pola jam ramai/sepi,
+  // sama seperti laporan bawaan Loyverse. Granularitas ini beda dari
+  // "Tren Omzet Harian" di atas (yang per-tanggal), jadi disimpan
+  // terpisah, bukan menggantikan.
+  function bucketByHour(receipts: Receipt[], handleRefund: boolean = false): number[] {
+    const hourly = new Array(24).fill(0);
+    for (const r of receipts) {
+      const created = new Date(r.created_at);
+      const wib = new Date(created.getTime() + 7 * 60 * 60 * 1000);
+      const hour = wib.getUTCHours();
+      const isRefund = handleRefund && (r.receipt_type || "").toUpperCase() === "REFUND";
+      const sign = isRefund ? -1 : 1;
+      hourly[hour] += sign * Math.abs(r.total_money || 0);
+    }
+    return hourly.map((v) => Math.round(v));
+  }
+  const hourly1 = bucketByHour(receipts1, false);
+  const hourly2 = bucketByHour(receipts2, true);
 
   const s1 = summarize(receipts1);
   const s2 = buildKasir2Items(receipts2);
+
+  // [BARU] Summary periode sebelumnya, untuk hitung persentase perubahan.
+  // Kasir 1 pakai summarize() biasa (belum handle refund, konsisten
+  // dengan cara Kasir 1 dihitung di tempat lain). Kasir 2 pakai
+  // buildKasir2Items() yang sudah handle refund.
+  const prevS1 = summarize(prevReceipts1);
+  const prevS2 = buildKasir2Items(prevReceipts2);
+  const totalOmzetPrev = prevS1.omzet + prevS2.omzet;
+  const totalLabaPrev = prevS1.laba + prevS2.laba;
+  const totalTransaksiPrev = prevS1.jumlahTransaksi + prevS2.jumlahTransaksi;
+
+  // [BARU] Riwayat refund khusus Kasir 2 (Kasir 1 belum handle refund)
+  const refundLog2 = extractRefundLog(receipts2);
+
+  // [BARU] Total gabungan varian Normal vs Cup Besar lintas semua item
+  // Kasir 2 (kecuali item yang dikecualikan di EXCLUDED_FROM_VARIANT_TOTAL)
+  // -- baca langsung dari receipts2 (raw), bukan dari s2.allItems, supaya
+  // item dengan hanya 1 jenis varian (flat, tanpa breakdown) tetap kehitung.
+  const variantTotals2 = buildVariantTotals(receipts2);
 
   const beyond31Days = isMoreThan31Days(fromDateStr, toDateStr);
   const isDataEmpty = s1.omzet === 0 && s2.omzet === 0;
@@ -424,6 +633,20 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
       variants: it.variants.map((v) => ({ label: v.label, qty: v.qty, omzet: Math.round(v.omzet) })),
     })),
     debug: { receipts1: receipts1.length, receipts2: receipts2.length },
+    refundLog2,
+    variantTotals2,
+    hourly1,
+    hourly2,
+    // [BARU] Perbandingan vs periode sebelumnya (panjang sama)
+    comparison: {
+      prevPeriode: `${prevFrom} s/d ${prevTo}`,
+      omzetChange: calcPercentChange(s1.omzet + s2.omzet, totalOmzetPrev),
+      omzetDiff: Math.round((s1.omzet + s2.omzet) - totalOmzetPrev),
+      labaChange: calcPercentChange(s1.laba + s2.laba, totalLabaPrev),
+      labaDiff: Math.round((s1.laba + s2.laba) - totalLabaPrev),
+      transaksiChange: calcPercentChange(s1.jumlahTransaksi + s2.jumlahTransaksi, totalTransaksiPrev),
+      transaksiDiff: (s1.jumlahTransaksi + s2.jumlahTransaksi) - totalTransaksiPrev,
+    },
     beyond31Days,
     isDataEmpty,
     from: fromDateStr,
@@ -433,7 +656,7 @@ async function buildDashboardData(env: Env, fromDateStr: string, toDateStr: stri
 
 // ================================================================
 // === RENDER HTML DASHBOARD -- KASIR 1 POLOS, KASIR 2 BERTINGKAT +
-// GRADASI EMAS (mirip laporan resmi Loyverse "Penjualan berdasarkan barang")
+// GRADASI EMAS (TIDAK DIUBAH SAMA SEKALI)
 // ================================================================
 function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>>): string {
   const fmt = (n: number) => "Rp" + Math.round(n).toLocaleString("id-ID");
@@ -444,6 +667,26 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
   const lastDayMonthAgo = getLastDayOfMonth(monthAgo);
 
   const showUpgradeMessage = data.beyond31Days && data.isDataEmpty;
+
+  // [BARU] Helper render badge perubahan persentase (mirip gaya Loyverse:
+  // +Rp37.000 (+9,14%)). null berarti "Baru" (periode sebelumnya nol).
+  const renderChangeBadge = (diff: number, pct: number | null, isMoney: boolean, invertColor: boolean = false): string => {
+    if (pct === null) {
+      return `<span class="text-xs text-gray-400 dark:text-gray-500">Baru (periode lalu Rp0)</span>`;
+    }
+    const positive = diff > 0;
+    const neutral = diff === 0;
+    // invertColor: dipakai untuk metrik dimana naik = kurang bagus (misal refund)
+    const isGood = invertColor ? !positive : positive;
+    const colorClass = neutral
+      ? "text-gray-400 dark:text-gray-500"
+      : isGood
+        ? "text-green-600 dark:text-green-400"
+        : "text-red-500 dark:text-red-400";
+    const sign = positive ? "+" : diff < 0 ? "" : "";
+    const diffText = isMoney ? fmt(diff) : `${diff}x`;
+    return `<span class="text-xs ${colorClass}">${sign}${diffText} (${sign}${pct.toFixed(1)}%)</span>`;
+  };
 
   const activeClass = (condition: boolean) =>
     condition
@@ -461,6 +704,21 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
         .join("");
       return parentRow + childRows;
     })
+    .join("");
+
+  // [BARU] Baris tabel riwayat refund
+  const refundRows = data.refundLog2
+    .map(
+      (rf) =>
+        `<tr class="border-b border-gray-100 dark:border-slate-700/50">
+          <td class="py-2 px-2 text-gray-400 dark:text-gray-500">${rf.time}</td>
+          <td class="py-2 px-2 font-mono text-xs">${rf.receiptNumber}${rf.refundFor ? ` <span class="text-gray-400">(dari ${rf.refundFor})</span>` : ""}</td>
+          <td class="py-2 px-2">${rf.itemName}</td>
+          <td class="py-2 px-2 text-gray-500 dark:text-gray-400">${rf.variantName}</td>
+          <td class="py-2 px-2">${rf.quantity}x</td>
+          <td class="py-2 px-2 text-red-500 dark:text-red-400">-${fmt(rf.money)}</td>
+        </tr>`
+    )
     .join("");
 
   return `<!DOCTYPE html>
@@ -499,9 +757,16 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
         </h1>
         <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
           Periode: ${data.periode} (${data.days} hari) • Total Omzet: ${fmt(data.totalOmzet1 + data.totalOmzet2)}
+          ${data.comparison.omzetChange !== null || data.comparison.omzetDiff !== 0 ? ` ${renderChangeBadge(data.comparison.omzetDiff, data.comparison.omzetChange, true)}` : ''}
         </p>
+        <p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5">vs periode sebelumnya (${data.comparison.prevPeriode})</p>
       </div>
       <div class="flex items-center gap-2 mt-2 md:mt-0">
+        ${data.refundLog2.length > 0 ? `
+        <span class="inline-flex items-center gap-1 text-xs bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-300 px-3 py-1 rounded-full border border-red-200 dark:border-red-800">
+          ↩️ ${data.refundLog2.length} refund
+        </span>
+        ` : ''}
         <span class="inline-flex items-center gap-1 text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 px-3 py-1 rounded-full border border-green-200 dark:border-green-800">
           <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Live
         </span>
@@ -578,6 +843,25 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
       </div>
     </div>
 
+    <!-- [BARU] Ringkasan perbandingan vs periode sebelumnya -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 mb-6 border border-gray-200 dark:border-slate-700">
+      <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">📊 Dibanding periode sebelumnya (${data.comparison.prevPeriode})</p>
+      <div class="flex flex-wrap gap-x-6 gap-y-2">
+        <div>
+          <span class="text-xs text-gray-400">Omzet: </span>
+          ${renderChangeBadge(data.comparison.omzetDiff, data.comparison.omzetChange, true)}
+        </div>
+        <div>
+          <span class="text-xs text-gray-400">Laba: </span>
+          ${renderChangeBadge(data.comparison.labaDiff, data.comparison.labaChange, true)}
+        </div>
+        <div>
+          <span class="text-xs text-gray-400">Transaksi: </span>
+          ${renderChangeBadge(data.comparison.transaksiDiff, data.comparison.transaksiChange, false)}
+        </div>
+      </div>
+    </div>
+
     <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-gray-200 dark:border-slate-700">
       <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
         <h2 class="text-base font-semibold">📈 Tren Omzet Harian</h2>
@@ -603,6 +887,24 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
       </div>
       <div class="chart-container" style="height:220px;">
         <canvas id="compareChart"></canvas>
+      </div>
+    </div>
+
+    <!-- [BARU] PENJUALAN PER JAM -- granularitas jam (00:00-23:00), digabung
+         lintas-tanggal kalau periode lebih dari 1 hari, sama seperti
+         laporan bawaan Loyverse. Beda dari "Tren Omzet Harian" di atas
+         yang granularitasnya per tanggal. -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-gray-200 dark:border-slate-700">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <h2 class="text-base font-semibold">🕐 Penjualan Per Jam</h2>
+        <div class="flex gap-1.5">
+          <button type="button" onclick="setChartType('hourly','bar')" data-chart="hourly" data-type="bar" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-amber-400 text-black border-amber-400 shadow-lg shadow-amber-400/30">📊 Batang</button>
+          <button type="button" onclick="setChartType('hourly','line')" data-chart="hourly" data-type="line" class="chart-type-btn px-3 py-1 rounded-lg text-xs font-medium border transition bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600">📈 Garis</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mb-2">Jam digabung dari semua tanggal di periode terpilih (${data.periode})</p>
+      <div class="chart-container">
+        <canvas id="hourlyChart"></canvas>
       </div>
     </div>
 
@@ -641,6 +943,70 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
         </table>
       </div>
       ` : `<p class="text-gray-400 text-sm py-4 text-center">${showUpgradeMessage ? '🔒 Upgrade untuk lihat data historis' : 'Tidak ada data'}</p>`}
+    </div>
+
+    <!-- [BARU] TOTAL GABUNGAN VARIAN NORMAL vs CUP BESAR (lintas item) -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border border-blue-400/30">
+      <h2 class="text-base font-semibold mb-3 flex items-center gap-2">
+        📐 Total Semua Varian - Kasir 2
+        <span class="text-xs font-normal text-blue-500 bg-blue-500/10 px-2 py-0.5 rounded-full">gabungan lintas item</span>
+      </h2>
+      <div class="table-scroll">
+        <table class="w-full text-sm">
+          <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-slate-700">
+            <tr><th class="text-left py-2">Varian</th><th class="text-left py-2">Qty</th><th class="text-left py-2">Omzet</th></tr>
+          </thead>
+          <tbody>
+            <tr class="border-b border-gray-100 dark:border-slate-700/50">
+              <td class="py-2">Normal (Cup Kecil)</td>
+              <td class="py-2">${data.variantTotals2.normal.qty}x</td>
+              <td class="py-2">${fmt(data.variantTotals2.normal.omzet)}</td>
+            </tr>
+            <tr class="border-b border-gray-100 dark:border-slate-700/50">
+              <td class="py-2">Cup Besar</td>
+              <td class="py-2">${data.variantTotals2.cupbesar.qty}x</td>
+              <td class="py-2">${fmt(data.variantTotals2.cupbesar.omzet)}</td>
+            </tr>
+            <tr class="font-semibold bg-blue-500/5">
+              <td class="py-2">Total</td>
+              <td class="py-2">${data.variantTotals2.normal.qty + data.variantTotals2.cupbesar.qty}x</td>
+              <td class="py-2">${fmt(data.variantTotals2.normal.omzet + data.variantTotals2.cupbesar.omzet)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-3">
+        Tidak termasuk item mandiri (dihitung sendiri, bukan digabung ke sini): ${data.variantTotals2.excludedNames.map(n => n.replace(/\b\w/g, c => c.toUpperCase())).join(', ')}
+      </p>
+    </div>
+
+    <!-- RIWAYAT REFUND (BARU) - Khusus Kasir 2, buat audit -->
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 md:p-6 mb-6 border ${data.refundLog2.length ? 'border-red-400/30' : 'border-gray-200 dark:border-slate-700'}">
+      <h2 class="text-base font-semibold mb-3 flex items-center gap-2">
+        ↩️ Riwayat Refund - Kasir 2
+        ${data.refundLog2.length
+          ? `<span class="text-xs font-normal text-red-500 bg-red-500/10 px-2 py-0.5 rounded-full">${data.refundLog2.length} transaksi</span>`
+          : `<span class="text-xs font-normal text-gray-400 bg-gray-400/10 px-2 py-0.5 rounded-full">tidak ada</span>`}
+      </h2>
+      ${data.refundLog2.length ? `
+      <div class="table-scroll">
+        <table class="w-full text-sm">
+          <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-slate-700">
+            <tr>
+              <th class="text-left py-2 px-2">Jam</th>
+              <th class="text-left py-2 px-2">Receipt</th>
+              <th class="text-left py-2 px-2">Item</th>
+              <th class="text-left py-2 px-2">Varian</th>
+              <th class="text-left py-2 px-2">Qty</th>
+              <th class="text-left py-2 px-2">Nominal</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${refundRows}
+          </tbody>
+        </table>
+      </div>
+      ` : `<p class="text-gray-400 text-sm py-4 text-center">Tidak ada refund di periode ini 👍</p>`}
     </div>
 
     <div class="text-center text-xs text-gray-400 dark:text-gray-500 border-t border-gray-200 dark:border-slate-700 pt-4 mt-4">
@@ -697,6 +1063,9 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
     const totalOmzet2 = ${data.totalOmzet2};
     const totalLaba1 = ${data.totalLaba1};
     const totalLaba2 = ${data.totalLaba2};
+    const hourly1 = ${JSON.stringify(data.hourly1)};
+    const hourly2 = ${JSON.stringify(data.hourly2)};
+    const hourLabels = Array.from({length: 24}, (_, i) => String(i).padStart(2, '0') + ':00');
 
     function themeColor() {
       return document.documentElement.classList.contains('dark') ? '#94a3b8' : '#64748b';
@@ -725,6 +1094,7 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
 
     let trendChartInstance = null;
     let compareChartInstance = null;
+    let hourlyChartInstance = null;
 
     function renderTrendChart(type) {
       if (trendChartInstance) trendChartInstance.destroy();
@@ -837,6 +1207,31 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
       }
     }
 
+    function renderHourlyChart(type) {
+      if (hourlyChartInstance) hourlyChartInstance.destroy();
+      const ctx = document.getElementById('hourlyChart');
+      hourlyChartInstance = new Chart(ctx, {
+        type: type,
+        data: {
+          labels: hourLabels,
+          datasets: [
+            { label: 'Kasir 1', data: hourly1, borderColor: '#3b82f6', backgroundColor: type === 'bar' ? '#3b82f6' : 'rgba(59,130,246,0.1)', fill: type === 'line', tension: 0.3 },
+            { label: 'Kasir 2', data: hourly2, borderColor: '#10b981', backgroundColor: type === 'bar' ? '#10b981' : 'rgba(16,185,129,0.1)', fill: type === 'line', tension: 0.3 }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 800, easing: 'easeInOutQuart' },
+          plugins: { legend: { labels: { color: legendColor() } } },
+          scales: {
+            x: { ticks: { color: themeColor(), maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
+            y: { ticks: { color: themeColor(), callback: v => 'Rp' + Number(v).toLocaleString('id-ID') } }
+          }
+        }
+      });
+    }
+
     function setChartType(chartName, type) {
       const buttons = document.querySelectorAll('.chart-type-btn[data-chart="' + chartName + '"]');
       buttons.forEach(btn => {
@@ -847,11 +1242,13 @@ function renderDashboardHTML(data: Awaited<ReturnType<typeof buildDashboardData>
             : 'bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 dark:bg-gray-700/50 dark:text-gray-300 dark:border-white/10 dark:hover:bg-gray-600');
       });
       if (chartName === 'trend') renderTrendChart(type);
+      else if (chartName === 'hourly') renderHourlyChart(type);
       else renderCompareChart(type);
     }
 
     renderTrendChart('line');
     renderCompareChart('bar');
+    renderHourlyChart('bar');
   </script>
 </body>
 </html>`;
